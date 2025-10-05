@@ -17,6 +17,7 @@ import random
 import re
 import struct
 import sys
+from ldap3.protocol.microsoft import security_descriptor_control
 
 
 VERSION = "1.2"
@@ -2599,20 +2600,31 @@ if __name__ == "__main__":
     if options.distinguishedName is not None and ls is not None:
         print("[+] Loading ntSecurityDescriptor from the LDAP object '%s'" % options.distinguishedName)
         try:
-            results = {}
-            results = ls.query(
-                base_dn=options.distinguishedName,
-                query="(distinguishedName=%s)" % options.distinguishedName.lower(),
-                attributes=["ntSecurityDescriptor"]
+            sd_ctrl = security_descriptor_control(sdflags=0x07)
+            ls.ldap_session.search(
+                search_base=options.distinguishedName,
+                search_filter="(objectClass=*)",
+                attributes=['ntSecurityDescriptor'],
+                controls=sd_ctrl
             )
         except Exception as e:
             print("[!] Error: %s" % e)
-
-        if len(results.keys()) != 0:
-            raw_ntsd_value = results[options.distinguishedName.lower()]["ntSecurityDescriptor"]
-            print("[+] ntSecurityDescriptor is loaded!")
         else:
-            print("[!] Could not find an object with the distinguishedName '%s'" % options.distinguishedName)
+            entry = next((r for r in ls.ldap_session.response if r.get('type') == 'searchResEntry'), None)
+            if not entry:
+                print("[!] No entries returned — check your DN or rights.")
+            else:
+                raw_vals = entry.get('raw_attributes', {}).get('ntSecurityDescriptor', [])
+                if isinstance(raw_vals, (list, tuple)):
+                    if raw_vals:
+                        raw_ntsd_value = raw_vals[0]
+                elif isinstance(raw_vals, (bytes, bytearray)):
+                    raw_ntsd_value = raw_vals
+
+                if raw_ntsd_value is None:
+                    print("[!] ntSecurityDescriptor empty — likely insufficient rights.")
+                else:
+                    print("[+] ntSecurityDescriptor is loaded!")
 
     # Read value from a file
     elif options.value is not None:
