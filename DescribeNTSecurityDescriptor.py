@@ -10,7 +10,7 @@ from enum import Enum, IntFlag
 import io
 import ldap3
 from ldap3.protocol.formatters.formatters import format_sid
-from sectools.windows.ldap.ldap import init_ldap_session
+from sectools.windows.ldap.ldap import init_ldap_session, ldap3_kerberos_login
 from sectools.windows.crypto import nt_hash, parse_lm_nt_hashes
 import os
 import random
@@ -18,6 +18,7 @@ import re
 import struct
 import sys
 from ldap3.protocol.microsoft import security_descriptor_control
+import ssl
 
 
 VERSION = "1.2"
@@ -28,6 +29,125 @@ VERSION = "1.2"
 LDAP_PAGED_RESULT_OID_STRING = "1.2.840.113556.1.4.319"
 # https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-adts/f14f3610-ee22-4d07-8a24-1bf1466cba5f
 LDAP_SERVER_NOTIFICATION_OID = "1.2.840.113556.1.4.528"
+
+
+def init_ldap_session_with_starttls(
+    auth_domain=None,
+    auth_dc_ip=None,
+    auth_username=None,
+    auth_password=None,
+    auth_lm_hash=None,
+    auth_nt_hash=None,
+    auth_key=None,
+    use_kerberos=False,
+    kdcHost=None,
+):
+    """
+    Initialize an LDAP session with STARTTLS support.
+
+    This function creates an LDAP connection using STARTTLS, which upgrades
+    an unencrypted LDAP connection to TLS/SSL. It supports the same authentication
+    methods as init_ldap_session.
+
+    Args:
+        auth_domain: Domain FQDN
+        auth_dc_ip: Domain controller IP address
+        auth_username: Username for authentication
+        auth_password: Password for authentication
+        auth_lm_hash: LM hash for authentication
+        auth_nt_hash: NT hash for authentication
+        auth_key: AES key for Kerberos authentication
+        use_kerberos: Whether to use Kerberos authentication
+        kdcHost: KDC hostname for Kerberos
+
+    Returns:
+        Tuple of (ldap_server, ldap_session)
+    """
+    # Normalize hash values
+    if auth_lm_hash is None:
+        auth_lm_hash = ""
+    if auth_nt_hash is None:
+        auth_nt_hash = ""
+
+    # Determine the DC address
+    if use_kerberos:
+        dc_addr = kdcHost
+    else:
+        dc_addr = auth_dc_ip if auth_dc_ip else auth_domain
+
+    # Create the LDAP server object with STARTTLS
+    # Use port 389 (standard LDAP) not 636 (LDAPS)
+    ldap_server = ldap3.Server(
+        dc_addr,
+        port=389,
+        use_ssl=False,
+        tls=ldap3.Tls(validate=ssl.CERT_NONE, version=ssl.PROTOCOL_TLSv1_2, ciphers='ALL:@SECLEVEL=0'),
+        get_info=ldap3.ALL
+    )
+
+    if use_kerberos:
+        # Kerberos authentication: create anonymous connection, start TLS, then authenticate
+        ldap_session = ldap3.Connection(server=ldap_server, auto_bind=False)
+
+        # Start TLS first
+        try:
+            ldap_session.open()
+            ldap_session.start_tls()
+        except Exception as e:
+            raise Exception(f"Failed to start TLS: {e}")
+
+        # Then authenticate using Kerberos
+        ldap3_kerberos_login(
+            connection=ldap_session,
+            target=dc_addr,
+            user=auth_username,
+            password=auth_password,
+            domain=auth_domain,
+            lmhash=auth_lm_hash,
+            nthash=auth_nt_hash,
+            aesKey=auth_key,
+            kdcHost=kdcHost
+        )
+    elif any([len(auth_nt_hash) != 0, len(auth_lm_hash) != 0]):
+        # Pass-the-hash authentication
+        if len(auth_lm_hash) == 0:
+            auth_lm_hash = "aad3b435b51404eeaad3b435b51404ee"
+        if len(auth_nt_hash) == 0:
+            auth_nt_hash = "31d6cfe0d16ae931b73c59d7e0c089c0"
+        ldap_session = ldap3.Connection(
+            ldap_server,
+            user='%s\\%s' % (auth_domain, auth_username),
+            password=auth_lm_hash + ":" + auth_nt_hash,
+            authentication=ldap3.NTLM,
+            auto_bind=False
+        )
+        try:
+            ldap_session.open()
+            ldap_session.start_tls()
+            ldap_session.bind()
+            if not ldap_session.bound:
+                raise Exception("Failed to bind to LDAP server")
+        except Exception as e:
+            raise Exception(f"Failed to bind to LDAP server: {e}")
+    else:
+        # Username/password authentication with NTLM
+        ldap_session = ldap3.Connection(
+            ldap_server,
+            user='%s\\%s' % (auth_domain, auth_username),
+            password=auth_password,
+            authentication=ldap3.NTLM,
+            auto_bind=False
+        )
+        try:
+            ldap_session.open()
+            ldap_session.start_tls()
+            ldap_session.bind()
+            if not ldap_session.bound:
+                raise Exception("Failed to bind to LDAP server")
+        except Exception as e:
+            raise Exception(f"Failed to bind to LDAP server: {e}")
+
+    return ldap_server, ldap_session
 
 
 class LDAPSearcher(object):
@@ -2512,6 +2632,7 @@ def parseArgs():
     source.add_argument("-D", "--distinguishedName", default=None, type=str, help="The distinguishedName of the object to be described by the NTSecurityDescriptor")
     
     parser.add_argument("--use-ldaps", action="store_true", default=False, help="Use LDAPS instead of LDAP")
+    parser.add_argument("--use-ldap-starttls", action="store_true", default=False, help="Use LDAP with STARTTLS instead of LDAP or LDAPS")
 
     parser.add_argument("--summary", action="store_true", default=False, help="Generate a human readable summary of the rights.")
     parser.add_argument("--describe", action="store_true", default=False, help="Describe the raw structure.")
@@ -2557,6 +2678,7 @@ if __name__ == "__main__":
     options = parseArgs()
 
     ls = None
+    dc_addr = options.dc_ip if options.dc_ip else options.auth_domain
     if options.auth_username is not None:
         # Parse hashes
         auth_lm_hash = ""
@@ -2576,19 +2698,34 @@ if __name__ == "__main__":
             exit()
 
         # Try to authenticate with specified credentials
-        print("[>] Try to authenticate as '%s\\%s' on %s ... " % (options.auth_domain, options.auth_username, options.dc_ip))
-        ldap_server, ldap_session = init_ldap_session(
-            auth_domain=options.auth_domain,
-            auth_dc_ip=options.dc_ip,
-            auth_username=options.auth_username,
-            auth_password=options.auth_password,
-            auth_lm_hash=auth_lm_hash,
-            auth_nt_hash=auth_nt_hash,
-            auth_key=options.auth_key,
-            use_kerberos=options.use_kerberos,
-            kdcHost=options.kdcHost,
-            use_ldaps=options.use_ldaps
-        )
+        print("[>] Try to authenticate as '%s\\%s' on %s ... " % (options.auth_domain, options.auth_username, dc_addr))
+
+        # Choose LDAP connection method based on options
+        if options.use_ldap_starttls:
+            ldap_server, ldap_session = init_ldap_session_with_starttls(
+                auth_domain=options.auth_domain,
+                auth_dc_ip=options.dc_ip,
+                auth_username=options.auth_username,
+                auth_password=options.auth_password,
+                auth_lm_hash=auth_lm_hash,
+                auth_nt_hash=auth_nt_hash,
+                auth_key=options.auth_key,
+                use_kerberos=options.use_kerberos,
+                kdcHost=options.kdcHost
+            )
+        else:
+            ldap_server, ldap_session = init_ldap_session(
+                auth_domain=options.auth_domain,
+                auth_dc_ip=options.dc_ip,
+                auth_username=options.auth_username,
+                auth_password=options.auth_password,
+                auth_lm_hash=auth_lm_hash,
+                auth_nt_hash=auth_nt_hash,
+                auth_key=options.auth_key,
+                use_kerberos=options.use_kerberos,
+                kdcHost=options.kdcHost,
+                use_ldaps=options.use_ldaps
+            )
         print("[+] Authentication successful!\n")
         ls = LDAPSearcher(
             ldap_server=ldap_server,
