@@ -7,18 +7,61 @@
 import argparse
 import binascii
 from enum import Enum, IntFlag
+import hashlib
 import io
 import ldap3
+import ldap3.strategy.sync
 from ldap3.protocol.formatters.formatters import format_sid
 from sectools.windows.ldap.ldap import init_ldap_session, ldap3_kerberos_login
 from sectools.windows.crypto import nt_hash, parse_lm_nt_hashes
 import os
 import random
 import re
+import string
 import struct
 import sys
 from ldap3.protocol.microsoft import security_descriptor_control
+from ldap3.protocol import rfc4511
+from ldap3.strategy.base import BaseStrategy
+from ldap3.core.results import RESULT_SUCCESS
+from ldap3.core.exceptions import LDAPExceptionError
+from ldap3.utils.asn1 import encode as ldap3_encode
+import socket
 import ssl
+from typing import Any, Dict, List, Optional, Tuple, cast
+import calendar
+import time
+from impacket.ntlm import (
+    AV_PAIRS,
+    KXKEY,
+    MAC,
+    NTLMSSP_AV_DNS_HOSTNAME,
+    NTLMSSP_AV_TARGET_NAME,
+    NTLMSSP_AV_TIME,
+    NTLMSSP_NEGOTIATE_56,
+    NTLMSSP_NEGOTIATE_128,
+    NTLMSSP_NEGOTIATE_ALWAYS_SIGN,
+    NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY,
+    NTLMSSP_NEGOTIATE_KEY_EXCH,
+    NTLMSSP_NEGOTIATE_NTLM,
+    NTLMSSP_NEGOTIATE_SEAL,
+    NTLMSSP_NEGOTIATE_SIGN,
+    NTLMSSP_NEGOTIATE_TARGET_INFO,
+    NTLMSSP_NEGOTIATE_UNICODE,
+    NTLMSSP_NEGOTIATE_VERSION,
+    NTLMSSP_REQUEST_TARGET,
+    SEAL,
+    SEALKEY,
+    SIGNKEY,
+    NTLMAuthChallenge,
+    NTLMAuthChallengeResponse,
+    NTLMAuthNegotiate,
+    NTLMMessageSignature,
+    NTOWFv2,
+    generateEncryptedSessionKey,
+    hmac_md5,
+)
+
 
 
 VERSION = "1.2"
@@ -29,6 +72,777 @@ VERSION = "1.2"
 LDAP_PAGED_RESULT_OID_STRING = "1.2.840.113556.1.4.319"
 # https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-adts/f14f3610-ee22-4d07-8a24-1bf1466cba5f
 LDAP_SERVER_NOTIFICATION_OID = "1.2.840.113556.1.4.528"
+
+# NTLM channel binding constant (from Certipy)
+NTLMSSP_AV_CHANNEL_BINDINGS = 0x0A
+
+
+# ============================================================================
+# Channel Binding Functions (from Certipy - certipy/lib/channel_binding.py)
+# ============================================================================
+
+def get_channel_binding_data(server_cert: bytes) -> bytes:
+    """
+    Generate channel binding token (CBT) from a server certificate.
+
+    This implements the tls-server-end-point channel binding type as described
+    in RFC 5929 section 4. The binding token is created by:
+    1. Hashing the server certificate with SHA-256
+    2. Creating a channel binding structure with the hash
+    3. Computing an MD5 hash of the structure
+
+    Args:
+        server_cert: Raw server certificate bytes
+
+    Returns:
+        MD5 hash of the channel binding structure (16 bytes)
+
+    References:
+        - RFC 5929: https://datatracker.ietf.org/doc/html/rfc5929#section-4
+    """
+    # Hash the certificate with SHA-256 as required by the RFC
+    cert_hash = hashlib.sha256(server_cert).digest()
+
+    # Initialize the channel binding structure with empty addresses
+    # These fields are defined in the RFC but not used for TLS bindings
+    initiator_address = b"\x00" * 8
+    acceptor_address = b"\x00" * 8
+
+    # Create the application data with the "tls-server-end-point:" prefix
+    application_data_raw = b"tls-server-end-point:" + cert_hash
+
+    # Add the length prefix to the application data (little-endian 32-bit integer)
+    len_application_data = len(application_data_raw).to_bytes(
+        4, byteorder="little", signed=False
+    )
+    application_data = len_application_data + application_data_raw
+
+    # Assemble the complete channel binding structure
+    channel_binding_struct = initiator_address + acceptor_address + application_data
+
+    # Return the MD5 hash of the structure
+    return hashlib.md5(channel_binding_struct).digest()
+
+
+def get_channel_binding_data_from_ssl_socket(ssl_socket: ssl.SSLSocket) -> bytes:
+    """
+    Extract channel binding data from an SSL socket.
+
+    This function extracts the server certificate from an SSL socket
+    and generates the channel binding token used for authentication.
+
+    Args:
+        ssl_socket: The SSL socket object containing TLS connection information
+
+    Returns:
+        The channel binding token as bytes
+
+    Raises:
+        ValueError: If unable to extract required TLS information from the socket
+    """
+    # Get the peer/server certificate in binary (DER) format
+    peer_cert = ssl_socket.getpeercert(True)
+
+    if peer_cert is None:
+        raise ValueError(
+            "No peer certificate found in SSL socket - server may not have presented a certificate"
+        )
+
+    # Generate and return channel binding data using the server certificate
+    return get_channel_binding_data(peer_cert)
+
+
+# ============================================================================
+# NTLM Functions (from Certipy - certipy/lib/ntlm.py)
+# ============================================================================
+
+def compute_response(
+    server_challenge: bytes,
+    client_challenge: bytes,
+    target_info: bytes,
+    domain: str,
+    user: str,
+    password: str,
+    nt_hash: str = "",
+    channel_binding_data: Optional[bytes] = None,
+    service: str = "HOST",
+) -> Tuple[bytes, bytes, bytes, bytes]:
+    """
+    Compute NTLMv2 response based on the provided parameters.
+
+    Args:
+        server_challenge: Challenge received from the server
+        client_challenge: Client-generated random challenge
+        target_info: Target information provided by the server
+        domain: Domain name for authentication
+        user: Username for authentication
+        password: Password for authentication
+        nt_hash: NT hash if available, otherwise password will be used
+        channel_binding_data: Channel binding data for EPA compliance
+        service: Service name for the SPN
+
+    Returns:
+        Tuple containing:
+        - NT challenge response
+        - LM challenge response
+        - Session base key
+        - Target hostname
+
+    Raises:
+        ValueError: If target information is missing DNS hostname
+    """
+    # Generate response key
+    response_key_nt = NTOWFv2(user, password, domain, bytes.fromhex(nt_hash) if nt_hash else "")  # type: ignore
+    av_pairs = AV_PAIRS(target_info)
+
+    # Add SPN (target name)
+    if av_pairs[NTLMSSP_AV_DNS_HOSTNAME] is None:
+        raise ValueError("NTLMSSP_AV_DNS_HOSTNAME not found in target info")
+
+    hostname = cast(Tuple[int, bytes], av_pairs[NTLMSSP_AV_DNS_HOSTNAME])[1]
+    spn = f"{service}/".encode("utf-16le") + hostname
+    av_pairs[NTLMSSP_AV_TARGET_NAME] = spn
+
+    # Add timestamp if not already present
+    if av_pairs[NTLMSSP_AV_TIME] is None:
+        timestamp = struct.pack(
+            "<q", (116444736000000000 + calendar.timegm(time.gmtime()) * 10000000)
+        )
+        av_pairs[NTLMSSP_AV_TIME] = timestamp
+
+    # Add channel bindings if provided
+    if channel_binding_data:
+        av_pairs[NTLMSSP_AV_CHANNEL_BINDINGS] = channel_binding_data
+
+    # Construct temp data for NT proof calculation
+    temp = (
+        b"\x01"  # RespType
+        + b"\x01"  # HiRespType
+        + b"\x00" * 2  # Reserved1
+        + b"\x00" * 4  # Reserved2
+        + cast(Tuple[int, bytes], av_pairs[NTLMSSP_AV_TIME])[1]  # Timestamp
+        + client_challenge  # ChallengeFromClient
+        + b"\x00" * 4  # Reserved
+        + av_pairs.getData()  # AvPairs
+    )
+
+    # Calculate response components
+    nt_proof_str = hmac_md5(response_key_nt, server_challenge + temp)
+    nt_challenge_response = nt_proof_str + temp
+    lm_challenge_response = (
+        hmac_md5(response_key_nt, server_challenge + client_challenge)
+        + client_challenge
+    )
+    session_base_key = hmac_md5(response_key_nt, nt_proof_str)
+
+    # Handle anonymous authentication
+    if not user and not password:
+        nt_challenge_response = b""
+        lm_challenge_response = b""
+
+    return nt_challenge_response, lm_challenge_response, session_base_key, hostname
+
+
+def ntlm_negotiate(
+    signing_required: bool = False,
+    use_ntlmv2: bool = True,
+    version: Optional[bytes] = None,
+) -> NTLMAuthNegotiate:
+    """
+    Generate an NTLMSSP Type 1 negotiation message.
+
+    Args:
+        signing_required: Whether signing is required for the connection
+        use_ntlmv2: Whether to use NTLMv2 (should be True for modern systems)
+        version: OS version to include in the message
+
+    Returns:
+        NTLMAuthNegotiate object representing the Type 1 message
+    """
+    # Create base negotiate message with standard flags
+    auth = NTLMAuthNegotiate()
+    auth["flags"] = (
+        NTLMSSP_NEGOTIATE_NTLM
+        | NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY
+        | NTLMSSP_NEGOTIATE_UNICODE
+        | NTLMSSP_REQUEST_TARGET
+        | NTLMSSP_NEGOTIATE_128
+        | NTLMSSP_NEGOTIATE_56
+    )
+
+    # Add security flags if signing is required
+    if signing_required:
+        auth["flags"] |= (
+            NTLMSSP_NEGOTIATE_KEY_EXCH
+            | NTLMSSP_NEGOTIATE_SIGN
+            | NTLMSSP_NEGOTIATE_ALWAYS_SIGN
+            | NTLMSSP_NEGOTIATE_SEAL
+        )
+
+    # Add NTLMv2 target info flag
+    if use_ntlmv2:
+        auth["flags"] |= NTLMSSP_NEGOTIATE_TARGET_INFO
+
+    # Add version if specified
+    if version:
+        auth["flags"] |= NTLMSSP_NEGOTIATE_VERSION
+        auth["os_version"] = version
+
+    return auth
+
+
+def ntlm_authenticate(
+    type1: NTLMAuthNegotiate,
+    challenge: NTLMAuthChallenge,
+    user: str,
+    password: str,
+    domain: str,
+    nt_hash: str = "",
+    channel_binding_data: Optional[bytes] = None,
+    service: str = "HOST",
+    version: Optional[bytes] = None,
+) -> Tuple[NTLMAuthChallengeResponse, bytes, int]:
+    """
+    Generate an NTLMSSP Type 3 authentication message in response to a server challenge.
+
+    Args:
+        type1: The Type 1 negotiate message that was sent
+        challenge: The Type 2 challenge message received from the server
+        user: Username for authentication
+        password: Password for authentication
+        domain: Domain name for authentication
+        nt_hash: NT hash if available, otherwise password will be used
+        channel_binding_data: Channel binding data for EPA compliance
+        service: Service name for the SPN
+        version: OS version to include in the message
+
+    Returns:
+        Tuple containing:
+        - NTLMAuthChallengeResponse object (Type 3 message)
+        - Exported session key for further operations
+        - Negotiated flags
+    """
+    # Get response flags from the initial negotiate message
+    response_flags = type1["flags"]
+
+    # Generate client challenge (8 random bytes)
+    client_challenge = struct.pack("<Q", random.getrandbits(64))
+
+    # Extract target info from the challenge
+    target_info = challenge["TargetInfoFields"]
+
+    # Compute the NTLM response components
+    nt_response, lm_response, session_base_key, hostname = compute_response(
+        challenge["challenge"],
+        client_challenge,
+        target_info,
+        domain,
+        user,
+        password,
+        nt_hash,
+        channel_binding_data,
+        service,
+    )
+
+    # Adjust response flags based on server capabilities
+    security_flags = [
+        NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY,
+        NTLMSSP_NEGOTIATE_128,
+        NTLMSSP_NEGOTIATE_KEY_EXCH,
+        NTLMSSP_NEGOTIATE_SEAL,
+        NTLMSSP_NEGOTIATE_SIGN,
+        NTLMSSP_NEGOTIATE_ALWAYS_SIGN,
+    ]
+
+    for flag in security_flags:
+        if not (challenge["flags"] & flag):
+            response_flags &= ~flag
+
+    # Calculate the key exchange key
+    key_exchange_key = KXKEY(
+        challenge["flags"],
+        session_base_key,
+        lm_response,
+        challenge["challenge"],
+        password,
+        "",
+        nt_hash,
+        True,
+    )
+
+    # Handle key exchange if required
+    if challenge["flags"] & NTLMSSP_NEGOTIATE_KEY_EXCH:
+        # Generate random session key
+        exported_session_key = "".join(
+            random.choices(string.ascii_letters + string.digits, k=16)
+        ).encode()
+        encrypted_random_session_key = generateEncryptedSessionKey(
+            key_exchange_key, exported_session_key
+        )
+    else:
+        encrypted_random_session_key = None
+        exported_session_key = key_exchange_key
+
+    # Create and populate the challenge response
+    challenge_response = NTLMAuthChallengeResponse(
+        user, password, challenge["challenge"]
+    )
+    challenge_response["flags"] = response_flags
+    challenge_response["domain_name"] = domain.encode("utf-16le")
+    challenge_response["host_name"] = hostname
+    challenge_response["lanman"] = lm_response if lm_response else b"\x00"
+    challenge_response["ntlm"] = nt_response
+
+    # Add version if specified
+    if version:
+        challenge_response["Version"] = version
+
+    # Add session key if key exchange is enabled
+    if encrypted_random_session_key:
+        challenge_response["session_key"] = encrypted_random_session_key
+
+    return challenge_response, exported_session_key, response_flags
+
+
+class NTLMCipher:
+    """
+    Handles NTLM message signing/sealing.
+    (from Certipy - certipy/lib/ntlm.py)
+    """
+
+    def __init__(self, flags: int, session_key: bytes):
+        self.flags = flags
+
+        # Same key for everything
+        self.client_sign_key = session_key
+        self.server_sign_key = session_key
+        self.client_seal_key = session_key
+        self.client_seal_key = session_key
+        cipher = ARC4.new(self.client_sign_key)
+        self.client_seal = cipher.encrypt
+        self.server_seal = cipher.encrypt
+
+        if self.flags & NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY:
+            self.client_sign_key = cast(bytes, SIGNKEY(self.flags, session_key))
+            self.server_sign_key = cast(
+                bytes, SIGNKEY(self.flags, session_key, "Server")
+            )
+            self.client_seal_key = SEALKEY(self.flags, session_key)
+            self.server_seal_key = SEALKEY(self.flags, session_key, "Server")
+
+            client_cipher = ARC4.new(self.client_seal_key)
+            self.client_seal = client_cipher.encrypt
+            server_cipher = ARC4.new(self.server_seal_key)
+            self.server_seal = server_cipher.encrypt
+
+        self.sequence = 0
+
+    def encrypt(self, plain_data: bytes) -> Tuple[NTLMMessageSignature, bytes]:
+        message, signature = SEAL(
+            self.flags,
+            self.client_sign_key,
+            self.client_seal_key,
+            plain_data,
+            plain_data,
+            self.sequence,
+            self.client_seal,
+        )
+
+        self.sequence += 1
+
+        return signature, message
+
+    def decrypt(self, answer: bytes) -> Tuple[NTLMMessageSignature, bytes]:
+        answer, signature = SEAL(
+            self.flags,
+            self.server_sign_key,
+            self.server_seal_key,
+            answer[:16],
+            answer[16:],
+            self.sequence,
+            self.server_seal,
+        )
+
+        return signature, answer
+
+
+# ============================================================================
+# Extended LDAP Classes (from Certipy - certipy/lib/ldap.py)
+# ============================================================================
+
+class ExtendedStrategy(ldap3.strategy.sync.SyncStrategy):
+    """
+    Extended strategy class for LDAP connections with encryption support.
+
+    This class extends the default SyncStrategy to provide custom
+    sending and receiving methods for LDAP messages. It handles
+    encryption and decryption of messages using NTLM or Kerberos
+    ciphers, as well as custom error handling.
+    """
+
+    def __init__(self, connection: "ExtendedLdapConnection") -> None:
+        """
+        Initialize the extended strategy with a connection.
+
+        Args:
+            connection: The ExtendedLdapConnection to use
+        """
+        super().__init__(connection)
+        self._connection = connection
+        # Override the default receiving method to use the custom implementation
+        self.receiving = self._receiving
+        self.sequence_number = 0
+
+    def sending(self, ldap_message: Any) -> None:
+        """
+        Send an LDAP message, optionally encrypting it first.
+
+        Args:
+            ldap_message: The LDAP message to send
+
+        Raises:
+            socket.error: If sending fails
+        """
+        try:
+            encoded_message = cast(bytes, ldap3_encode(ldap_message))
+
+            # Encrypt the message if required and not in SASL progress
+            if self._connection.should_encrypt and not self.connection.sasl_in_progress:
+                encoded_message = self._connection._encrypt(encoded_message)
+                self.sequence_number += 1
+
+            self.connection.socket.sendall(encoded_message)
+        except socket.error as e:
+            self.connection.last_error = f"socket sending error: {e}"
+            raise
+
+        # Update usage statistics if enabled
+        if self.connection.usage:
+            self.connection._usage.update_transmitted_message(
+                self.connection.request, len(encoded_message)
+            )
+
+    def _receiving(self) -> List[bytes]:  # type: ignore
+        """
+        Receive data over the socket and handle message encryption/decryption.
+
+        Returns:
+            List of received LDAP messages
+
+        Raises:
+            Exception: On socket or receive errors
+        """
+        messages = []
+        receiving = True
+        unprocessed = b""
+        data = b""
+        get_more_data = True
+        sasl_total_bytes_received = 0
+        sasl_received_data = b""
+        sasl_next_packet = b""
+        sasl_buffer_length = -1
+
+        while receiving:
+            if get_more_data:
+                try:
+                    data = self.connection.socket.recv(self.socket_size)
+                except (OSError, socket.error, AttributeError) as e:
+                    self.connection.last_error = f"error receiving data: {e}"
+                    try:
+                        self.close()
+                    except (socket.error, LDAPExceptionError):
+                        pass
+                    raise
+
+                # Handle encrypted messages (from NTLM or Kerberos)
+                if (
+                    self._connection.should_encrypt
+                    and not self.connection.sasl_in_progress
+                ):
+                    data = sasl_next_packet + data
+
+                    if sasl_received_data == b"" or sasl_next_packet:
+                        # Get the size of the encrypted message
+                        sasl_buffer_length = int.from_bytes(data[0:4], "big")
+                        data = data[4:]
+                    sasl_next_packet = b""
+                    sasl_total_bytes_received += len(data)
+                    sasl_received_data += data
+
+                    # Check if we have received the complete encrypted message
+                    if sasl_total_bytes_received >= sasl_buffer_length:
+                        # Handle multi-packet SASL messages
+                        # When the LDAP response is split across multiple TCP packets,
+                        # the SASL buffer length might not match our socket buffer size
+                        sasl_next_packet = sasl_received_data[sasl_buffer_length:]
+
+                        # Decrypt the received message
+                        sasl_received_data = self._connection._decrypt(
+                            sasl_received_data[:sasl_buffer_length]
+                        )
+                        sasl_total_bytes_received = 0
+                        unprocessed += sasl_received_data
+                        sasl_received_data = b""
+                else:
+                    unprocessed += data
+
+            if len(data) > 0:
+                # Try to compute the message length
+                length = BaseStrategy.compute_ldap_message_size(unprocessed)
+
+                if length == -1:  # too few data to decode message length
+                    get_more_data = True
+                    continue
+
+                if len(unprocessed) < length:
+                    get_more_data = True
+                else:
+                    messages.append(unprocessed[:length])
+                    unprocessed = unprocessed[length:]
+                    get_more_data = False
+                    if len(unprocessed) == 0:
+                        receiving = False
+            else:
+                receiving = False
+
+        return messages
+
+
+class ExtendedLdapConnection(ldap3.Connection):
+    """
+    Extended LDAP connection class with support for secure communication.
+
+    This class extends the ldap3.Connection class to provide additional
+    functionality for LDAP operations, including support for NTLM and
+    Kerberos encryption, channel binding, and custom error handling.
+    """
+
+    def __init__(
+        self, *args: Any, channel_binding: bool = True, use_starttls: bool = False,
+        ldap_signing: bool = False, **kwargs: Any
+    ) -> None:
+        """
+        Initialize an extended LDAP connection with the specified target.
+
+        Args:
+            channel_binding: Whether to use channel binding (default: True)
+            use_starttls: Whether using StartTLS (default: False)
+            ldap_signing: Whether LDAP signing is required (default: False)
+            *args: Additional positional arguments for the parent class
+            **kwargs: Additional keyword arguments for the parent class
+        """
+        super().__init__(*args, **kwargs)
+
+        # Replace standard strategy with extended strategy
+        self.strategy = ExtendedStrategy(self)
+
+        # Store connection properties
+        self.channel_binding = channel_binding
+        self.use_starttls = use_starttls
+        self.ldap_signing = ldap_signing
+        self.negotiated_flags = 0
+
+        # Encryption-related attributes
+        self.ntlm_cipher: Optional[NTLMCipher] = None
+        self.should_encrypt = False
+
+        # Alias important methods from strategy for direct access
+        self.send = self.strategy.send
+        self.open = self.strategy.open
+        self.get_response = self.strategy.get_response
+        self.post_send_single_response = self.strategy.post_send_single_response
+        self.post_send_search = self.strategy.post_send_search
+
+    def _encrypt(self, data: bytes) -> bytes:
+        """
+        Encrypt LDAP message data using the appropriate cipher.
+
+        Args:
+            data: Plaintext data to encrypt
+
+        Returns:
+            Encrypted data with appropriate headers and signatures
+        """
+        if self.ntlm_cipher is not None:
+            # NTLM encryption
+            signature, data = self.ntlm_cipher.encrypt(data)
+            data = signature.getData() + data
+            data = len(data).to_bytes(4, byteorder="big", signed=False) + data
+
+        return data
+
+    def _decrypt(self, data: bytes) -> bytes:
+        """
+        Decrypt LDAP message data using the appropriate cipher.
+
+        Args:
+            data: Encrypted data to decrypt
+
+        Returns:
+            Decrypted plaintext data
+        """
+        if self.ntlm_cipher is not None:
+            # NTLM decryption
+            _, data = self.ntlm_cipher.decrypt(data)
+
+        return data
+
+    def do_ntlm_bind(
+        self, username: str, password: str, domain: str, nt_hash: str = "", controls: Any = None
+    ) -> Dict[str, Any]:
+        """
+        Perform NTLM bind operation with optional controls.
+
+        This method implements the complete NTLM authentication flow:
+        1. Sicily package discovery to verify NTLM support
+        2. NTLM negotiate message exchange
+        3. Challenge/response handling with optional channel binding
+        4. Session key establishment and encryption setup
+
+        Args:
+            username: Username for authentication
+            password: Password for authentication
+            domain: Domain name for authentication
+            nt_hash: NT hash if available, otherwise password will be used
+            controls: Optional LDAP controls to apply during the bind operation
+
+        Returns:
+            Result of the bind operation
+
+        Raises:
+            Exception: If NTLM authentication fails or is not supported
+        """
+        self.last_error = None  # type: ignore
+
+        with self.connection_lock:
+            if not self.sasl_in_progress:
+                self.sasl_in_progress = True  # NTLM uses SASL-like authentication flow
+                try:
+                    # Step 1: Sicily package discovery to check for NTLM support
+                    request = rfc4511.BindRequest()
+                    request["version"] = rfc4511.Version(self.version)
+                    request["name"] = ""
+                    request[
+                        "authentication"
+                    ] = rfc4511.AuthenticationChoice().setComponentByName(
+                        "sicilyPackageDiscovery", rfc4511.SicilyPackageDiscovery("")
+                    )
+
+                    response = self.post_send_single_response(
+                        self.send("bindRequest", request, controls)
+                    )
+
+                    result = response[0]
+
+                    if not "server_creds" in result:
+                        raise Exception(
+                            "Server did not return available authentication packages during discovery request"
+                        )
+
+                    # Check if NTLM is supported
+                    sicily_packages = result["server_creds"].decode().split(";")
+                    if not "NTLM" in sicily_packages:
+                        raise Exception(
+                            f"NTLM authentication not available on server. Supported packages: {sicily_packages}"
+                        )
+
+                    # Step 2: Send NTLM negotiate message
+                    use_signing = self.ldap_signing and not self.server.ssl and not self.use_starttls
+                    negotiate = ntlm_negotiate(use_signing)
+
+                    request = rfc4511.BindRequest()
+                    request["version"] = rfc4511.Version(self.version)
+                    request["name"] = "NTLM"
+                    request[
+                        "authentication"
+                    ] = rfc4511.AuthenticationChoice().setComponentByName(
+                        "sicilyNegotiate", rfc4511.SicilyNegotiate(negotiate.getData())
+                    )
+
+                    response = self.post_send_single_response(
+                        self.send("bindRequest", request, controls)
+                    )
+
+                    result = response[0]
+
+                    if result["result"] != RESULT_SUCCESS:
+                        return result
+
+                    if not "server_creds" in result:
+                        raise Exception(
+                            "Server did not return NTLM challenge during bind request"
+                        )
+
+                    # Step 3: Process challenge and prepare authenticate response
+                    challenge = NTLMAuthChallenge()
+                    challenge.fromString(result["server_creds"])
+
+                    channel_binding_data = None
+                    use_channel_binding = (
+                        self.channel_binding and (self.server.ssl or self.use_starttls)
+                    )
+                    if use_channel_binding:
+                        if not isinstance(self.socket, ssl.SSLSocket):
+                            raise Exception(
+                                "LDAP server is using SSL but the connection is not an SSL socket"
+                            )
+
+                        # Extract channel binding data from SSL socket
+                        channel_binding_data = get_channel_binding_data_from_ssl_socket(
+                            self.socket
+                        )
+
+                    # Generate NTLM authenticate message
+                    challenge_response, session_key, negotiated_flags = (
+                        ntlm_authenticate(
+                            negotiate,
+                            challenge,
+                            username,
+                            password or "",
+                            domain,
+                            nt_hash,
+                            channel_binding_data=channel_binding_data,
+                        )
+                    )
+
+                    # Step 4: Set up encryption if negotiated
+                    self.negotiated_flags = negotiated_flags
+                    self.should_encrypt = (
+                        negotiated_flags & NTLMSSP_NEGOTIATE_SEAL
+                        == NTLMSSP_NEGOTIATE_SEAL
+                    )
+
+                    if self.should_encrypt:
+                        self.ntlm_cipher = NTLMCipher(
+                            negotiated_flags,
+                            session_key,
+                        )
+
+                    # Step 5: Complete authentication with the NTLM authenticate message
+                    request = rfc4511.BindRequest()
+                    request["version"] = rfc4511.Version(self.version)
+                    request["name"] = ""
+                    request[
+                        "authentication"
+                    ] = rfc4511.AuthenticationChoice().setComponentByName(
+                        "sicilyResponse",
+                        rfc4511.SicilyResponse(challenge_response.getData()),
+                    )
+
+                    response = self.post_send_single_response(
+                        self.send("bindRequest", request, controls)
+                    )
+
+                    result = response[0]
+
+                    if result["result"] == RESULT_SUCCESS:
+                        self.bound = True
+
+                    return result
+                finally:
+                    self.sasl_in_progress = False
+            else:
+                raise Exception("SASL authentication already in progress")
 
 
 def init_ldap_session_with_starttls(
@@ -108,44 +922,134 @@ def init_ldap_session_with_starttls(
             aesKey=auth_key,
             kdcHost=kdcHost
         )
-    elif any([len(auth_nt_hash) != 0, len(auth_lm_hash) != 0]):
-        # Pass-the-hash authentication
-        if len(auth_lm_hash) == 0:
-            auth_lm_hash = "aad3b435b51404eeaad3b435b51404ee"
-        if len(auth_nt_hash) == 0:
-            auth_nt_hash = "31d6cfe0d16ae931b73c59d7e0c089c0"
-        ldap_session = ldap3.Connection(
-            ldap_server,
-            user='%s\\%s' % (auth_domain, auth_username),
-            password=auth_lm_hash + ":" + auth_nt_hash,
-            authentication=ldap3.NTLM,
-            auto_bind=False
-        )
-        try:
-            ldap_session.open()
-            ldap_session.start_tls()
-            ldap_session.bind()
-            if not ldap_session.bound:
-                raise Exception("Failed to bind to LDAP server")
-        except Exception as e:
-            raise Exception(f"Failed to bind to LDAP server: {e}")
     else:
-        # Username/password authentication with NTLM
-        ldap_session = ldap3.Connection(
+        # NTLM authentication (password or hash) with signing and channel binding support
+        ldap_session = ExtendedLdapConnection(
             ldap_server,
-            user='%s\\%s' % (auth_domain, auth_username),
-            password=auth_password,
-            authentication=ldap3.NTLM,
-            auto_bind=False
+            auto_bind=False,
+            use_starttls=True,
+            ldap_signing=True,
+            channel_binding=True
         )
+
         try:
             ldap_session.open()
             ldap_session.start_tls()
-            ldap_session.bind()
-            if not ldap_session.bound:
-                raise Exception("Failed to bind to LDAP server")
         except Exception as e:
-            raise Exception(f"Failed to bind to LDAP server: {e}")
+            raise Exception(f"Failed to start TLS: {e}")
+
+        # Perform NTLM bind with signing support
+        result = ldap_session.do_ntlm_bind(
+            username=auth_username,
+            password=auth_password if auth_password else "",
+            domain=auth_domain,
+            nt_hash=auth_nt_hash if auth_nt_hash else ""
+        )
+
+        if result["result"] != RESULT_SUCCESS:
+            raise Exception(f"Failed to bind to LDAP server: {result}")
+
+    return ldap_server, ldap_session
+
+
+def init_ldap_session_with_ldaps(
+    auth_domain=None,
+    auth_dc_ip=None,
+    auth_username=None,
+    auth_password=None,
+    auth_lm_hash=None,
+    auth_nt_hash=None,
+    auth_key=None,
+    use_kerberos=False,
+    kdcHost=None,
+):
+    """
+    Initialize an LDAP session with LDAPS (SSL on port 636) support.
+
+    This function creates an LDAP connection using LDAPS with signing and
+    channel binding support for NTLM authentication.
+
+    Args:
+        auth_domain: Domain FQDN
+        auth_dc_ip: Domain controller IP address
+        auth_username: Username for authentication
+        auth_password: Password for authentication
+        auth_lm_hash: LM hash for authentication
+        auth_nt_hash: NT hash for authentication
+        auth_key: AES key for Kerberos authentication
+        use_kerberos: Whether to use Kerberos authentication
+        kdcHost: KDC hostname for Kerberos
+
+    Returns:
+        Tuple of (ldap_server, ldap_session)
+    """
+    # Normalize hash values
+    if auth_lm_hash is None:
+        auth_lm_hash = ""
+    if auth_nt_hash is None:
+        auth_nt_hash = ""
+
+    # Determine the DC address
+    if use_kerberos:
+        dc_addr = kdcHost
+    else:
+        dc_addr = auth_dc_ip if auth_dc_ip else auth_domain
+
+    # Create the LDAP server object with LDAPS (SSL on port 636)
+    ldap_server = ldap3.Server(
+        dc_addr,
+        port=636,
+        use_ssl=True,
+        tls=ldap3.Tls(validate=ssl.CERT_NONE, version=ssl.PROTOCOL_TLSv1_2, ciphers='ALL:@SECLEVEL=0'),
+        get_info=ldap3.ALL
+    )
+
+    if use_kerberos:
+        # Kerberos authentication
+        ldap_session = ldap3.Connection(server=ldap_server, auto_bind=False)
+
+        try:
+            ldap_session.open()
+        except Exception as e:
+            raise Exception(f"Failed to connect to LDAPS: {e}")
+
+        # Authenticate using Kerberos
+        ldap3_kerberos_login(
+            connection=ldap_session,
+            target=dc_addr,
+            user=auth_username,
+            password=auth_password,
+            domain=auth_domain,
+            lmhash=auth_lm_hash,
+            nthash=auth_nt_hash,
+            aesKey=auth_key,
+            kdcHost=kdcHost
+        )
+    else:
+        # NTLM authentication with signing and channel binding support
+        ldap_session = ExtendedLdapConnection(
+            ldap_server,
+            auto_bind=False,
+            use_starttls=False,
+            ldap_signing=False,  # Not needed over SSL
+            channel_binding=True
+        )
+
+        try:
+            ldap_session.open()
+        except Exception as e:
+            raise Exception(f"Failed to connect to LDAPS: {e}")
+
+        # Perform NTLM bind with channel binding support
+        result = ldap_session.do_ntlm_bind(
+            username=auth_username,
+            password=auth_password if auth_password else "",
+            domain=auth_domain,
+            nt_hash=auth_nt_hash if auth_nt_hash else ""
+        )
+
+        if result["result"] != RESULT_SUCCESS:
+            raise Exception(f"Failed to bind to LDAP server: {result}")
 
     return ldap_server, ldap_session
 
@@ -2713,6 +3617,18 @@ if __name__ == "__main__":
                 use_kerberos=options.use_kerberos,
                 kdcHost=options.kdcHost
             )
+        elif options.use_ldaps:
+            ldap_server, ldap_session = init_ldap_session_with_ldaps(
+                auth_domain=options.auth_domain,
+                auth_dc_ip=options.dc_ip,
+                auth_username=options.auth_username,
+                auth_password=options.auth_password,
+                auth_lm_hash=auth_lm_hash,
+                auth_nt_hash=auth_nt_hash,
+                auth_key=options.auth_key,
+                use_kerberos=options.use_kerberos,
+                kdcHost=options.kdcHost
+            )
         else:
             ldap_server, ldap_session = init_ldap_session(
                 auth_domain=options.auth_domain,
@@ -2724,7 +3640,7 @@ if __name__ == "__main__":
                 auth_key=options.auth_key,
                 use_kerberos=options.use_kerberos,
                 kdcHost=options.kdcHost,
-                use_ldaps=options.use_ldaps
+                use_ldaps=False
             )
         print("[+] Authentication successful!\n")
         ls = LDAPSearcher(
